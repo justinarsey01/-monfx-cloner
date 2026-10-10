@@ -1,4 +1,4 @@
-
+from dotenv import load_dotenv
 import asyncio
 import json
 import os
@@ -9,7 +9,7 @@ from flask import Flask
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-
+load_dotenv()
 # Read credentials from Render environment variables
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
