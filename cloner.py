@@ -1,64 +1,126 @@
-import asyncio, json, os
+
+import asyncio
+import json
+import os
+import threading
+from pathlib import Path
+
+from flask import Flask
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-from flask import Flask
-import threading
 
-API_ID = 36172139
-API_HASH = "48c2263f359396145f5f9df9ffa07909"
-FROM_INVITE = "https://t.me/+1_4KcZxZuMJkYTE8"
-TO_CHANNEL = "https://t.me/monfxtradingofficial"
-MAP_FILE = "reply_map.json"
-SESSION_STRING = os.environ.get("SESSION_STRING")
+# Read credentials from Render environment variables
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]
 
-if os.path.exists(MAP_FILE):
-    with open(MAP_FILE, 'r') as f:
-        id_map = json.load(f)
+# Prefer numeric source chat ID, e.g. -1001234567890.
+# Set SOURCE_CHAT_ID in Render after obtaining the correct ID.
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
+TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
+
+MAP_FILE = Path("reply_map.json")
+map_lock = threading.Lock()
+
+if MAP_FILE.exists():
+    try:
+        id_map = {
+            int(k): int(v)
+            for k, v in json.loads(MAP_FILE.read_text()).items()
+        }
+    except (ValueError, OSError, json.JSONDecodeError):
+        id_map = {}
 else:
     id_map = {}
-id_map = {int(k): int(v) for k, v in id_map.items()}
+
+
 def save_map():
-    with open(MAP_FILE, 'w') as f:
-        json.dump(id_map, f)
+    with map_lock:
+        temp_file = MAP_FILE.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(id_map))
+        temp_file.replace(MAP_FILE)
+
 
 app = Flask(__name__)
-@app.route('/')
-def home():
-    return f"Cloner running - {len(id_map)} mapped"
-threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "mapped_messages": len(id_map)
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
 
 async def main():
-    while True:
+    client = TelegramClient(
+        StringSession(SESSION_STRING),
+        API_ID,
+        API_HASH,
+    )
+
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError(
+            "Telegram session is invalid or expired. "
+            "Generate a new SESSION_STRING."
+        )
+
+    source = await client.get_entity(SOURCE_CHAT_ID)
+    target = await client.get_entity(TARGET_CHANNEL)
+
+    print(f"Telegram account connected.")
+    print(f"Watching source: {source.title if hasattr(source, 'title') else source.id}")
+    print(f"Copying to target: {target.id}")
+
+    @client.on(events.NewMessage(chats=source))
+    async def handler(event):
         try:
-            await client.start()
-            from_group = await client.get_entity(FROM_INVITE)
-            print(f"Watching: {from_group.title}")
-            @client.on(events.NewMessage(chats=from_group))
-            async def handler(event):
-                try:
-                    reply_to_dest_id = None
-                    if event.message.is_reply:
-                        replied_id = event.message.reply_to.reply_to_msg_id
-                        if replied_id in id_map:
-                            reply_to_dest_id = id_map[replied_id]
-                    if reply_to_dest_id:
-                        sent = await client.send_message(TO_CHANNEL, event.message, reply_to=reply_to_dest_id)
-                    else:
-                        sent = await client.send_message(TO_CHANNEL, event.message)
-                    id_map[event.message.id] = sent.id
-                    save_map()
-                    print(f"Copied {event.message.id} -> {sent.id}")
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except Exception as e:
-                    print(f"Error: {e}")
-            await client.run_until_disconnected()
-        except Exception as e:
-            print(f"Restarting: {e}")
-            await asyncio.sleep(10)
+            original = event.message
+            destination_reply_id = None
+
+            if original.reply_to and original.reply_to.reply_to_msg_id:
+                source_reply_id = original.reply_to.reply_to_msg_id
+                destination_reply_id = id_map.get(source_reply_id)
+
+            # Copy the message content and media without forwarding attribution.
+            sent = await client.send_message(
+                target,
+                original,
+                reply_to=destination_reply_id,
+            )
+
+            with map_lock:
+                id_map[original.id] = sent.id
+            save_map()
+
+            print(f"Copied message {original.id} -> {sent.id}")
+
+        except FloodWaitError as exc:
+            print(f"Telegram rate limit: wait {exc.seconds} seconds")
+            await asyncio.sleep(exc.seconds)
+        except Exception as exc:
+            print(f"Message copy failed: {exc}")
+
+    try:
+        print("Listening for new messages...")
+        await client.run_until_disconnected()
+    finally:
+        await client.disconnect()
+
 
 if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
     asyncio.run(main())
