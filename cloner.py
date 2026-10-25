@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 from flask import Flask
 from telethon import TelegramClient, events, utils
@@ -31,10 +32,68 @@ except Exception:
 
 def parse_chat(value):
     """Numeric IDs become ints; @usernames and links stay as strings."""
-    value = value.strip()
+    value = str(value).strip()
     if value.lstrip("-").isdigit():
         return int(value)
     return value
+
+
+def split_targets(value):
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise RuntimeError('"targets" must be a list (or comma-separated text)')
+    return [parse_chat(v) for v in items if str(v).strip()]
+
+
+def load_routes():
+    """Read the routes: each one copies a source channel to its own targets.
+
+    Preferred: set ROUTES to JSON, e.g.
+
+      ROUTES=[
+        {"name": "Client A", "source": -1001111111111,
+         "targets": ["@client_a_channel", "-1002222222222"]},
+        {"name": "Client B", "source": "@client_b_source",
+         "targets": ["@client_b_channel"], "enabled": false}
+      ]
+
+    Without ROUTES, the old settings SOURCE_CHAT_ID + TARGET_CHANNEL
+    (comma-separated) still work as a single route.
+    """
+    raw = os.environ.get("ROUTES", "").strip()
+
+    if not raw:
+        return [{
+            "name": "default",
+            "source": parse_chat(os.environ["SOURCE_CHAT_ID"]),
+            "targets": split_targets(os.environ["TARGET_CHANNEL"]),
+            "enabled": True,
+        }]
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ROUTES is not valid JSON: {exc}") from exc
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("ROUTES must be a non-empty JSON list of routes")
+
+    routes = []
+    for number, item in enumerate(data, 1):
+        if not isinstance(item, dict) or "source" not in item or "targets" not in item:
+            raise RuntimeError(f'Route #{number} needs both "source" and "targets"')
+        routes.append({
+            "name": str(item.get("name") or f"route {number}"),
+            "source": parse_chat(item["source"]),
+            "targets": split_targets(item["targets"]),
+            "enabled": item.get("enabled", True) is not False,
+        })
+    return routes
 
 
 # Read credentials from Render environment variables
@@ -42,14 +101,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 
-# Prefer numeric source chat ID, e.g. -1001234567890.
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
-
-# One or more target channels, separated by commas, e.g.
-#   TARGET_CHANNEL=@channel_one,@channel_two,-1001234567890
-TARGET_CHANNELS = [
-    parse_chat(v) for v in os.environ["TARGET_CHANNEL"].split(",") if v.strip()
-]
+ROUTES = load_routes()
 
 # Text added at the top of copies of forwarded posts.
 FORWARD_LABEL = os.environ.get("FORWARD_LABEL", "↪️ Forwarded from")
@@ -64,36 +116,39 @@ MAP_FILE = Path("reply_map.json")
 map_lock = threading.Lock()
 
 
-def load_saved_map():
-    """Load the saved message map.
+def map_key(source_id, target_id):
+    return f"{source_id}:{target_id}"
 
-    Returns (per_target_map, legacy_map).
-      per_target_map: {target_id: {source_msg_id: copied_msg_id}}
-      legacy_map:     the old single-target format {source_msg_id: copied_msg_id}
-    """
+
+def load_saved_map():
+    """Load {"<source_id>:<target_id>": {source_msg_id: copied_msg_id}}."""
     if not MAP_FILE.exists():
-        return {}, {}
+        return {}
     try:
         raw = json.loads(MAP_FILE.read_text())
     except (OSError, json.JSONDecodeError):
-        return {}, {}
+        return {}
 
     try:
-        if raw and all(isinstance(v, dict) for v in raw.values()):
-            return (
-                {
-                    int(target): {int(k): int(v) for k, v in mapping.items()}
-                    for target, mapping in raw.items()
-                },
-                {},
+        if raw and not all(
+            isinstance(k, str) and ":" in k and isinstance(v, dict)
+            for k, v in raw.items()
+        ):
+            print(
+                "Saved message map is from an older version; starting fresh "
+                "(older posts won't be matched for replies, edits or deletes)."
             )
-        return {}, {int(k): int(v) for k, v in raw.items()}
+            return {}
+        return {
+            k: {int(a): int(b) for a, b in mapping.items()}
+            for k, mapping in raw.items()
+        }
     except (ValueError, TypeError, AttributeError):
-        return {}, {}
+        return {}
 
 
-# id_map[target_id][source_msg_id] = copied_msg_id
-id_map, legacy_map = load_saved_map()
+# id_map[map_key(source_id, target_id)][source_msg_id] = copied_msg_id
+id_map = load_saved_map()
 
 
 def save_map():
@@ -110,7 +165,7 @@ app = Flask(__name__)
 def home():
     return {
         "status": "online",
-        "targets": len(id_map),
+        "route_targets": len(id_map),
         "mapped_messages": sum(len(m) for m in id_map.values()),
     }
 
@@ -265,6 +320,55 @@ async def copy_message(client, target, original, reply_to):
         )
 
 
+async def resolve_routes(client):
+    """Look up every route's source and targets. Anything that can't be found
+    is skipped and logged, so one bad entry never stops the other clients."""
+    routes = []
+
+    for spec in ROUTES:
+        name = spec["name"]
+
+        if not spec["enabled"]:
+            print(f"[{name}] disabled - skipping")
+            continue
+
+        try:
+            source = await client.get_entity(spec["source"])
+        except Exception as exc:
+            print(f"[{name}] could not resolve source {spec['source']!r}: "
+                  f"{exc!r} - route skipped")
+            continue
+
+        targets = []
+        for target_spec in spec["targets"]:
+            try:
+                entity = await client.get_entity(target_spec)
+            except Exception as exc:
+                print(f"[{name}] could not resolve target {target_spec!r}: "
+                      f"{exc!r} - target skipped")
+                continue
+
+            if entity.id == source.id:
+                print(f"[{name}] target {target_spec!r} is the source channel "
+                      "itself - skipped (would loop forever)")
+                continue
+            if any(t.id == entity.id for t in targets):
+                print(f"[{name}] target {target_spec!r} listed twice - "
+                      "ignoring the duplicate")
+                continue
+
+            targets.append(entity)
+            id_map.setdefault(map_key(source.id, entity.id), {})
+
+        if not targets:
+            print(f"[{name}] no valid targets - route skipped")
+            continue
+
+        routes.append(SimpleNamespace(name=name, source=source, targets=targets))
+
+    return routes
+
+
 async def main():
     client = TelegramClient(
         StringSession(SESSION_STRING),
@@ -280,50 +384,26 @@ async def main():
             "Generate a new SESSION_STRING."
         )
 
-    source = await client.get_entity(SOURCE_CHAT_ID)
-
-    # Resolve every target. A target that can't be resolved is skipped (and
-    # logged) so one bad entry doesn't stop the others.
-    targets = []
-    for spec in TARGET_CHANNELS:
-        try:
-            entity = await client.get_entity(spec)
-        except Exception as exc:
-            print(f"Could not resolve target {spec!r}: {exc!r} - skipping it")
-            continue
-        if any(t.id == entity.id for t in targets):
-            print(f"Target {spec!r} listed twice - ignoring the duplicate")
-            continue
-        targets.append(entity)
-        id_map.setdefault(entity.id, {})
-
-    if not targets:
+    routes = await resolve_routes(client)
+    if not routes:
         raise RuntimeError(
-            "No valid target channels. Check the TARGET_CHANNEL setting "
-            "(comma-separated @usernames or numeric IDs)."
+            "No usable routes. Check ROUTES (or SOURCE_CHAT_ID and "
+            "TARGET_CHANNEL) and that the account has joined the channels."
         )
 
-    # Older versions tracked a single target. Attach that history to the
-    # first target (keep your original channel first in TARGET_CHANNEL).
-    if legacy_map:
-        with map_lock:
-            id_map[targets[0].id].update(legacy_map)
-        legacy_map.clear()
-        save_map()
-
     print("Telegram account connected.")
-    print(f"Watching source: {name_of(source)}")
-    for target in targets:
-        print(f"Copying to target: {name_of(target)} ({target.id})")
+    for route in routes:
+        print(f"[{route.name}] watching {name_of(route.source)} -> "
+              + ", ".join(name_of(t) for t in route.targets))
 
-    # Handle one event at a time, in arrival order. This keeps copies in the
-    # right order, makes sure a reply's parent is already mapped, and means an
-    # edit or delete never races ahead of the copy it refers to.
+    # Handle one event at a time, in arrival order, across all routes. This
+    # keeps copies in the right order, makes sure a reply's parent is already
+    # mapped, and means an edit or delete never races ahead of its copy.
     send_lock = asyncio.Lock()
 
-    async def copy_to_target(target, original):
-        target_map = id_map[target.id]
-        label = name_of(target)
+    async def copy_to_target(route, target, original):
+        target_map = id_map[map_key(route.source.id, target.id)]
+        label = f"{route.name} > {name_of(target)}"
         try:
             reply_id = None
             if original.reply_to and original.reply_to.reply_to_msg_id:
@@ -361,9 +441,9 @@ async def main():
         except Exception as exc:
             print(f"Message copy FAILED for {original.id} [{label}]: {exc!r}")
 
-    async def edit_in_target(target, edited, text, entities):
-        label = name_of(target)
-        destination_id = id_map[target.id].get(edited.id)
+    async def edit_in_target(route, target, edited, text, entities):
+        label = f"{route.name} > {name_of(target)}"
+        destination_id = id_map[map_key(route.source.id, target.id)].get(edited.id)
 
         if destination_id is None:
             # Posted before the last restart, or never copied to this target.
@@ -388,9 +468,9 @@ async def main():
         except Exception as exc:
             print(f"Message edit FAILED for {edited.id} [{label}]: {exc!r}")
 
-    async def delete_in_target(target, source_ids):
-        label = name_of(target)
-        target_map = id_map[target.id]
+    async def delete_in_target(route, target, source_ids):
+        label = f"{route.name} > {name_of(target)}"
+        target_map = id_map[map_key(route.source.id, target.id)]
         destination_ids = [target_map[i] for i in source_ids if i in target_map]
 
         if not destination_ids:
@@ -412,42 +492,48 @@ async def main():
         except Exception as exc:
             print(f"Message delete FAILED for {source_ids} [{label}]: {exc!r}")
 
-    @client.on(events.NewMessage(chats=source))
-    async def on_new(event):
-        original = event.message
-        kind = type(original.media).__name__ if original.media else "text"
-        forwarded = ", forwarded" if original.fwd_from else ""
-        print(f"Received message {original.id} ({kind}{forwarded})")
+    def register(route):
+        # A separate function per route, so each handler keeps its own route.
 
-        try:
-            async with send_lock:
-                # Each target is independent: a failure in one never blocks
-                # the others.
-                for target in targets:
-                    await copy_to_target(target, original)
-        except Exception as exc:
-            print(f"Message copy FAILED for {original.id}: {exc!r}")
+        @client.on(events.NewMessage(chats=route.source))
+        async def on_new(event):
+            original = event.message
+            kind = type(original.media).__name__ if original.media else "text"
+            forwarded = ", forwarded" if original.fwd_from else ""
+            print(f"[{route.name}] Received message {original.id} ({kind}{forwarded})")
 
-    @client.on(events.MessageEdited(chats=source))
-    async def on_edit(event):
-        edited = event.message
-        try:
-            async with send_lock:
-                text, entities = await build_content(edited)
-                for target in targets:
-                    await edit_in_target(target, edited, text, entities)
-        except Exception as exc:
-            print(f"Message edit FAILED for {edited.id}: {exc!r}")
+            try:
+                async with send_lock:
+                    # Each target is independent: a failure in one never
+                    # blocks the others.
+                    for target in route.targets:
+                        await copy_to_target(route, target, original)
+            except Exception as exc:
+                print(f"[{route.name}] Message copy FAILED for {original.id}: {exc!r}")
 
-    @client.on(events.MessageDeleted(chats=source))
-    async def on_delete(event):
-        source_ids = list(event.deleted_ids)
-        try:
-            async with send_lock:
-                for target in targets:
-                    await delete_in_target(target, source_ids)
-        except Exception as exc:
-            print(f"Message delete FAILED for {source_ids}: {exc!r}")
+        @client.on(events.MessageEdited(chats=route.source))
+        async def on_edit(event):
+            edited = event.message
+            try:
+                async with send_lock:
+                    text, entities = await build_content(edited)
+                    for target in route.targets:
+                        await edit_in_target(route, target, edited, text, entities)
+            except Exception as exc:
+                print(f"[{route.name}] Message edit FAILED for {edited.id}: {exc!r}")
+
+        @client.on(events.MessageDeleted(chats=route.source))
+        async def on_delete(event):
+            source_ids = list(event.deleted_ids)
+            try:
+                async with send_lock:
+                    for target in route.targets:
+                        await delete_in_target(route, target, source_ids)
+            except Exception as exc:
+                print(f"[{route.name}] Message delete FAILED for {source_ids}: {exc!r}")
+
+    for route in routes:
+        register(route)
 
     try:
         print("Listening for new, edited and deleted messages...")
