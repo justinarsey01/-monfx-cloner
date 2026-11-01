@@ -104,15 +104,21 @@ def load_routes():
     return routes
 
 
+def clean_session(value):
+    """Session strings never contain spaces or line breaks, so remove any that
+    sneak in when pasting, along with quotes around the whole value."""
+    return "".join(value.split()).strip("\"'")
+
+
 def load_accounts():
     """{account name: session string}. 'main' is SESSION_STRING; every
     SESSION_STRING_<NAME> variable adds another account called <NAME>."""
-    accounts = {"main": os.environ["SESSION_STRING"].strip()}
+    accounts = {"main": clean_session(os.environ["SESSION_STRING"])}
     prefix = "SESSION_STRING_"
     for key, value in os.environ.items():
         name = key[len(prefix):].strip().lower() if key.startswith(prefix) else ""
-        if name and name != "main" and value.strip():
-            accounts[name] = value.strip()
+        if name and name != "main" and clean_session(value):
+            accounts[name] = clean_session(value)
     return accounts
 
 
@@ -408,9 +414,28 @@ async def resolve_routes(client, specs):
 async def run_account(account, session_string, specs, started):
     """Log in one Telegram account and run the routes assigned to it."""
     tag = f"account {account}"
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    variable = (
+        "SESSION_STRING" if account == "main"
+        else f"SESSION_STRING_{account.upper()}"
+    )
+    client = None
 
     try:
+        try:
+            client = TelegramClient(
+                StringSession(session_string), API_ID, API_HASH
+            )
+        except Exception as exc:
+            # A truncated or mangled string fails right here (for example
+            # "Incorrect padding"). Only this account is affected.
+            print(
+                f"[{tag}] the value of {variable} is not a valid session "
+                f"string ({exc}). It has {len(session_string)} characters; a "
+                "real one is about 350 and starts with 1. Copy the whole "
+                "string again. This account was not started."
+            )
+            return
+
         await client.connect()
 
         if not await client.is_user_authorized():
@@ -590,10 +615,11 @@ async def run_account(account, session_string, specs, started):
     except Exception as exc:
         print(f"[{tag}] stopped with error: {exc!r}")
     finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 async def main():
